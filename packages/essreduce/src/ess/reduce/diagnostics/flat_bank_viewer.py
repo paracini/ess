@@ -61,8 +61,9 @@ class FlatBankViewer(ipw.VBox):
         Dims that are not in a bank are ignored for that bank.
         Dims on neither axis are sliced. If neither axis is specified, dims not
         listed in ``sliced`` start on the vertical axis, except for the last dim,
-        which starts on the horizontal axis. Drag axis tags to reorder them;
-        adding a dim to one axis removes it from the other.
+        which starts on the horizontal axis. Drag dimensions to reorder them or
+        move them between axes. Remove a dimension from an axis to slice it;
+        use the slicer's X/Y buttons to move it back to an axis.
         The direction controls reverse the displayed axes without changing the data.
         Scipp may reject layouts with more than six unsliced dimensions. Failed
         layouts show an error instead of leaving the previous plot visible.
@@ -346,7 +347,7 @@ def _to_plot_data(da: sc.DataArray) -> sc.DataArray:
 
 
 class _DimensionConfigs(ipw.VBox):
-    """Ordered axis tags and persistent sliders for unassigned dimensions."""
+    """Ordered axis dimensions and persistent sliders for unassigned dimensions."""
 
     def __init__(
         self,
@@ -362,13 +363,11 @@ class _DimensionConfigs(ipw.VBox):
             value=list(layout.horizontal),
             allowed_tags=list(da.dims),
             allow_duplicates=False,
-            placeholder="Add dimension",
         )
         self.vertical = ipw.TagsInput(
             value=list(layout.vertical),
             allowed_tags=list(da.dims),
             allow_duplicates=False,
-            placeholder="Add dimension",
         )
         self.invert_horizontal = ipw.Checkbox(
             description="Right to left",
@@ -381,8 +380,9 @@ class _DimensionConfigs(ipw.VBox):
             layout=ipw.Layout(width="10em", flex="0 0 auto"),
         )
         for tags in (self.horizontal, self.vertical):
-            tags.add_class("ess-flat-bank-axis")
-            tags.tooltip = "Type a dimension name and press Enter to add it."
+            tags.tooltip = (
+                "Drag dimensions to reorder or move between axes; remove to slice."
+            )
             tags.layout = ipw.Layout(flex="1 1 auto", width="auto", min_width="0")
         self.slicers = {
             dim: CombinedSlicer(
@@ -390,6 +390,14 @@ class _DimensionConfigs(ipw.VBox):
             )
             for dim in self._dims
         }
+        # Keep the rows as well as the slicers so updates do not rebuild controls.
+        self._slicer_rows = {
+            dim: self._slicer_row(dim, slicer) for dim, slicer in self.slicers.items()
+        }
+        self._slicer_help = ipw.HTML(
+            "Dimensions on neither axis are sliced below. "
+            "Use X or Y to move a dimension to that axis."
+        )
         self._slicers_box = ipw.VBox()
         self._updating = False
 
@@ -407,31 +415,30 @@ class _DimensionConfigs(ipw.VBox):
                 self._axis_row("X axis", self.horizontal, self.invert_horizontal),
                 self._axis_row("Y axis", self.vertical, self.invert_vertical),
                 ipw.HTML(
-                    # TagsInput hides its input wrapper on blur and after updates.
-                    # Scope this override to our axis controls, including when full.
-                    """
-<style>
-.ess-flat-bank-axis > .widget-text {
-    display: inline-block !important;
-}
-.ess-flat-bank-axis .jupyter-widget-taginput {
-    border: 1px dashed var(--jp-border-color1, #999);
-    border-radius: 3px;
-    min-width: 14ch;
-}
-.ess-flat-bank-axis .jupyter-widget-taginput:focus {
-    border-style: solid;
-    border-color: var(--jp-brand-color1, #2196f3);
-}
-</style>
-"""
-                    "Type a dimension name and press Enter to add it. "
-                    "Drag tags to reorder (last dimension varies fastest). "
-                    "Dimensions on neither axis are sliced below."
+                    "Drag dimensions to reorder (last dimension varies fastest) "
+                    "or move between axes. Remove a dimension from an axis to slice it."
                 ),
+                self._slicer_help,
                 self._slicers_box,
             ]
         )
+
+    def _slicer_row(self, dim: str, slicer: CombinedSlicer) -> ipw.HBox:
+        buttons = []
+        for label, axis in (("X", self.horizontal), ("Y", self.vertical)):
+            button = ipw.Button(
+                description=label,
+                tooltip=f"Move {dim} to the {label.lower()} axis",
+                layout=ipw.Layout(width="3em", flex="0 0 auto"),
+            )
+            button.on_click(partial(self._move_to_axis, dim, axis))
+            buttons.append(button)
+        return ipw.HBox([*buttons, slicer], layout=ipw.Layout(align_items="center"))
+
+    def _move_to_axis(self, dim: str, axis: ipw.TagsInput, _button: ipw.Button) -> None:
+        # Ignore queued clicks after the row has disappeared, including double clicks.
+        if dim in self.axis_layout.sliced:
+            axis.value = [*axis.value, dim]
 
     @staticmethod
     def _axis_row(label: str, tags: ipw.TagsInput, reverse: ipw.Checkbox) -> ipw.HBox:
@@ -464,9 +471,9 @@ class _DimensionConfigs(ipw.VBox):
         )
 
     def _update_slicers(self) -> None:
-        self._slicers_box.children = [
-            self.slicers[dim] for dim in self.axis_layout.sliced
-        ]
+        sliced = self.axis_layout.sliced
+        self._slicers_box.children = [self._slicer_rows[dim] for dim in sliced]
+        self._slicer_help.layout.display = None if sliced else "none"
 
     def _on_slider_change(self, dim: str, change: dict[str, Any]) -> None:
         if dim in self.axis_layout.sliced:

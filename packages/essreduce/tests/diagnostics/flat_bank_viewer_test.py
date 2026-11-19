@@ -68,6 +68,7 @@ def test_defaults_assign_all_dimensions_to_axes(da: sc.DataArray) -> None:
     assert configs.vertical.value == ["arc", "channel", "tube"]
     assert configs.axis_layout.sliced == ()
     assert configs._slicers_box.children == ()
+    assert configs._slicer_help.layout.display == "none"
 
 
 @pytest.mark.parametrize("axis", ["horizontal", "vertical"])
@@ -108,12 +109,14 @@ def test_unassigned_dimensions_show_sliders_and_keep_their_values(
     configs = _DimensionConfigs(da)
     slice_dim(configs, "tube")
     slicer = configs.slicers["tube"]
-    assert configs._slicers_box.children == (slicer,)
+    row = configs._slicers_box.children[0]
+    assert row.children[-1] is slicer
+    assert configs._slicer_help.layout.display is None
     slicer.slider.value = (1, 2)
     configs.horizontal.value = ["tube", *configs.horizontal.value]
     assert configs._slicers_box.children == ()
     slice_dim(configs, "tube")
-    assert configs._slicers_box.children == (slicer,)
+    assert configs._slicers_box.children == (row,)
     assert configs.state_node().slices == {"tube": (1, 2)}
 
 
@@ -122,9 +125,45 @@ def test_slider_order_does_not_omit_unspecified_dimensions(da: sc.DataArray) -> 
     configs.horizontal.value = []
     configs.vertical.value = []
     assert configs.axis_layout.sliced == ("tube", "arc", "channel", "length")
-    assert configs._slicers_box.children == tuple(
+    assert tuple(row.children[-1] for row in configs._slicers_box.children) == tuple(
         configs.slicers[dim] for dim in configs.axis_layout.sliced
     )
+
+
+@pytest.mark.parametrize(("axis", "button_index"), [("horizontal", 0), ("vertical", 1)])
+def test_slicer_axis_buttons_update_once_and_preserve_range(
+    da: sc.DataArray, axis: str, button_index: int
+) -> None:
+    configs = _DimensionConfigs(da)
+    slice_dim(configs, "tube")
+    configs.slicers["tube"].slider.value = (1, 2)
+    row = configs._slicers_box.children[0]
+    target = getattr(configs, axis)
+    original = list(target.value)
+    calls = []
+    sink = pp.Node(lambda state: calls.append(state), configs.state_node)
+    sink()
+    calls.clear()
+
+    row.children[button_index].click()
+
+    assert target.value == [*original, "tube"]
+    assert len(calls) == 1
+    assert calls[0].layout == configs.axis_layout
+    assert calls[0].slices == {}
+    assert configs._slicers_box.children == ()
+    assert configs._slicer_help.layout.display == "none"
+
+    # Clicks already queued on the hidden row must not duplicate or move the tag.
+    row.children[button_index].click()
+    row.children[1 - button_index].click()
+    assert target.value == [*original, "tube"]
+    assert len(calls) == 1
+
+    slice_dim(configs, "tube")
+    assert configs._slicers_box.children == (row,)
+    assert configs._slicer_help.layout.display is None
+    assert configs.state_node().slices == {"tube": (1, 2)}
 
 
 def test_each_input_edit_emits_one_consistent_state(da: sc.DataArray) -> None:
@@ -297,6 +336,19 @@ def test_image_tracks_successive_input_changes_and_rerenders(da: sc.DataArray) -
         (configs.vertical, ["channel", "arc"]),
     ):
         control.set_state({"value": value})
+        assert_figure_matches_inputs(view, da)
+
+    # Exercise the buttons through to the rendered image, including recovery
+    # when an empty axis has hidden the plot.
+    figure = view._figure
+    for axis, button_index in ((configs.horizontal, 0), (configs.vertical, 1)):
+        dim = axis.value[0]
+        axis.value = []
+        configs.slicers[dim].slider.value = (1, 1)
+        assert_figure_matches_inputs(view, da)
+        configs._slicer_rows[dim].children[button_index].click()
+        assert axis.value == [dim]
+        assert view._figure is figure
         assert_figure_matches_inputs(view, da)
 
 
