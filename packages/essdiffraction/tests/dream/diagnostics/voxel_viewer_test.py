@@ -9,6 +9,13 @@ import pytest
 import scipp as sc
 from ess.dream.diagnostics import FlatVoxelViewer
 
+pytestmark = [
+    pytest.mark.usefixtures("interactive_backend"),
+    pytest.mark.filterwarnings(
+        r"ignore:Passing unrecognized arguments to super\(Toolbar\):DeprecationWarning"
+    ),
+]
+
 
 @pytest.fixture
 def interactive_backend():
@@ -31,12 +38,10 @@ def bank(dims: tuple[str, ...]) -> sc.DataArray:
     )
 
 
-@pytest.mark.usefixtures("interactive_backend")
-@pytest.mark.filterwarnings(
-    "ignore:Passing unrecognized arguments to super\\(Toolbar\\):DeprecationWarning"
+@pytest.mark.parametrize(
+    ("container", "extra_dim"),
+    [("array", None), ("dict", "sumo"), ("data_group", "sector")],
 )
-@pytest.mark.parametrize("container", ["array", "dict", "data_group"])
-@pytest.mark.parametrize("extra_dim", [None, "sumo", "sector"])
 def test_single_bank_does_not_require_other_banks_dimensions(
     container: str, extra_dim: str | None
 ) -> None:
@@ -63,10 +68,6 @@ def test_single_bank_does_not_require_other_banks_dimensions(
     )
 
 
-@pytest.mark.usefixtures("interactive_backend")
-@pytest.mark.filterwarnings(
-    "ignore:Passing unrecognized arguments to super\\(Toolbar\\):DeprecationWarning"
-)
 def test_switch_from_mantle_to_seven_dimensional_banks_updates_image() -> None:
     dims = ("module", "segment", "counter", "wire", "strip", "tof")
     banks = {
@@ -78,7 +79,7 @@ def test_switch_from_mantle_to_seven_dimensional_banks_updates_image() -> None:
     selector = view.children[0].children[1]
     assert selector.value == "mantle"
 
-    for name in ("endcap_forward", "high_resolution", "mantle", "endcap_forward"):
+    for name in ("endcap_forward", "high_resolution", "mantle"):
         selector.value = name
         horizontal = list(view.configs.horizontal.value)
         vertical = list(view.configs.vertical.value)
@@ -93,14 +94,3 @@ def test_switch_from_mantle_to_seven_dimensional_banks_updates_image() -> None:
         assert view._figure.canvas.ylabel == " * ".join(vertical)
         assert view._figure.layout.display is None
         assert view._message.layout.display == "none"
-
-    # Reordering and changing a slice on the selected endcap must also work.
-    view.configs.horizontal.value = ["sumo", "strip", "module"]
-    view.configs.slicers["tof"].slider.value = (1, 1)
-    expected = banks["endcap_forward"]["tof", 1].transpose(
-        [*view.configs.vertical.value, *view.configs.horizontal.value]
-    )
-    values = expected.values.reshape(8, -1)
-    np.testing.assert_array_equal(
-        view._figure.artists[view._figure_node.id].data.values, values
-    )

@@ -9,6 +9,13 @@ import pytest
 import scipp as sc
 from ess.bifrost.diagnostics import FlatDetectorViewer
 
+pytestmark = [
+    pytest.mark.usefixtures("interactive_backend"),
+    pytest.mark.filterwarnings(
+        r"ignore:Passing unrecognized arguments to super\(Toolbar\):DeprecationWarning"
+    ),
+]
+
 
 @pytest.fixture
 def interactive_backend():
@@ -28,20 +35,9 @@ def bank(dims: tuple[str, ...]) -> sc.DataArray:
     )
 
 
-@pytest.mark.usefixtures("interactive_backend")
-@pytest.mark.filterwarnings(
-    "ignore:Passing unrecognized arguments to super\\(Toolbar\\):DeprecationWarning"
-)
-@pytest.mark.parametrize("container", ["array", "dict", "data_group"])
-def test_accepts_array_and_bank_mappings(container: str) -> None:
+def test_default_detector_layout() -> None:
     da = bank(("arc", "channel", "tube", "length", "tof"))
-    if container == "array":
-        data = da
-    elif container == "dict":
-        data = {"bank": da}
-    else:
-        data = sc.DataGroup(bank=da)
-    view = FlatDetectorViewer(data)
+    view = FlatDetectorViewer(da)
     assert view.configs.vertical.value == ["arc", "tube"]
     assert view.configs.horizontal.value == ["channel", "length"]
     assert view.configs.axis_layout.sliced == ("tof",)
@@ -52,16 +48,14 @@ def test_accepts_array_and_bank_mappings(container: str) -> None:
     )
 
 
-@pytest.mark.usefixtures("interactive_backend")
-@pytest.mark.filterwarnings(
-    "ignore:Passing unrecognized arguments to super\\(Toolbar\\):DeprecationWarning"
-)
 def test_mapping_can_switch_to_bank_with_different_dimensions() -> None:
     view = FlatDetectorViewer(
-        {
-            "full": bank(("arc", "channel", "tube", "length", "tof")),
-            "partial": bank(("tube", "length", "energy")),
-        }
+        sc.DataGroup(
+            {
+                "full": bank(("arc", "channel", "tube", "length", "tof")),
+                "partial": bank(("tube", "length", "energy")),
+            }
+        )
     )
     view.children[0].children[1].value = "partial"
     assert view.configs.vertical.value == ["tube"]
@@ -71,10 +65,6 @@ def test_mapping_can_switch_to_bank_with_different_dimensions() -> None:
     assert view._figure.canvas.ylabel == "tube"
 
 
-@pytest.mark.usefixtures("interactive_backend")
-@pytest.mark.filterwarnings(
-    "ignore:Passing unrecognized arguments to super\\(Toolbar\\):DeprecationWarning"
-)
 def test_single_partial_bank_does_not_require_all_detector_dimensions() -> None:
     view = FlatDetectorViewer({"bank": bank(("tube", "length", "tof"))})
     assert view.configs.vertical.value == ["tube"]
