@@ -33,18 +33,26 @@ class FlatVoxelViewer(FlatBankViewer):
         ----------
         data:
             Histogrammed data, one entry per bank.
-            cbar:
-                Whether to show a colorbar.
+        cbar:
+            Whether to show a colorbar.
         rasterized:
             If ``True``, the figure is rasterized which improves rendering
             speed but reduces resolution.
         **kwargs:
             Additional arguments passed to :func:`plopp.imagefigure`.
         """
-        vertical = ('counter', 'segment', 'wire')
-        horizontal = ('module', 'strip', 'sumo', 'sector')
+        data = _prepare_data(data)
+        dims = (
+            data.dims
+            if isinstance(data, sc.DataArray)
+            else {dim for bank in data.values() for dim in bank.dims}
+        )
+        vertical = tuple(dim for dim in ('counter', 'segment', 'wire') if dim in dims)
+        horizontal = tuple(
+            dim for dim in ('module', 'strip', 'sumo', 'sector') if dim in dims
+        )
         super().__init__(
-            _prepare_data(data),
+            data,
             dims=(*vertical, *horizontal),
             sliced=(),
             vertical=vertical,

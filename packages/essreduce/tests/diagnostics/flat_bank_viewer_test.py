@@ -2,15 +2,16 @@
 # Copyright (c) 2026 Scipp contributors (https://github.com/scipp)
 import math
 
+import numpy as np
 import plopp as pp
 import pytest
 import scipp as sc
+from traitlets import TraitError
 
 from ess.reduce.diagnostics.flat_bank_viewer import (
     FlatBankViewer,
-    _DimensionConfig,
     _DimensionConfigs,
-    _DimensionSettings,
+    _prepare_plot,
     _unwrap_flat_indices_2d,
 )
 
@@ -56,309 +57,334 @@ def view_test(func):
     )(func)
 
 
-def flat(axis: str, primary: bool = False) -> _DimensionSettings:
-    return _DimensionSettings(mode="flatten", axis=axis, primary=primary)
+def slice_dim(configs: _DimensionConfigs, dim: str) -> None:
+    for axis in (configs.horizontal, configs.vertical):
+        axis.value = [d for d in axis.value if d != dim]
 
 
-SLICE = _DimensionSettings(mode="slice", axis="vertical", primary=False)
+def test_defaults_assign_all_dimensions_to_axes(da: sc.DataArray) -> None:
+    configs = _DimensionConfigs(da)
+    assert configs.horizontal.value == ["length"]
+    assert configs.vertical.value == ["arc", "channel", "tube"]
+    assert configs.axis_layout.sliced == ()
+    assert configs._slicers_box.children == ()
 
 
-def set_mode(configs: _DimensionConfigs, dim: str, mode: str) -> None:
-    # Simulates a click on the mode buttons.
-    configs[dim]._mode_button.value = mode
-
-
-def summarize(configs: _DimensionConfigs) -> dict[str, str | tuple[str, bool]]:
-    return {
-        dim: "slice" if s.mode == "slice" else (s.axis, s.primary)
-        for dim, s in configs.settings.items()
-    }
-
-
-def assert_valid_axes(configs: _DimensionConfigs) -> None:
-    flattened = [s for s in configs.settings.values() if s.mode == "flatten"]
-    for axis in ("vertical", "horizontal"):
-        on_axis = [s for s in flattened if s.axis == axis]
-        assert on_axis
-        assert sum(s.primary for s in on_axis) == 1
-
-
-def record_events(configs: _DimensionConfigs) -> dict[str, list[str]]:
-    events = {"slider": [], "config": []}
-    configs.on_slider_change(lambda config, _: events["slider"].append(config.dim))
-    configs.on_config_change(lambda config, _: events["config"].append(config.dim))
-    return events
-
-
-def test_dimension_configs_initial_settings(da: sc.DataArray) -> None:
-    settings = {
-        "tube": SLICE,
-        "length": flat("vertical", primary=True),
-        "arc": flat("horizontal", primary=True),
-    }
-    configs = _DimensionConfigs(da, settings=settings)
-    assert summarize(configs) == {
-        "arc": ("horizontal", True),
-        "channel": ("vertical", False),
-        "tube": "slice",
-        "length": ("vertical", True),
-    }
-    assert configs["tube"]._slicer.layout.display == "flex"
-    assert configs["tube"]._axis.layout.display == "none"
-    assert configs["arc"]._slicer.layout.display == "none"
-
-
-@pytest.mark.parametrize(
-    ("mode", "displays"),
-    [("slice", ("flex", "none", "none")), ("flatten", ("none", "flex", "flex"))],
-)
-def test_switching_mode_updates_visible_controls(
-    da: sc.DataArray,
-    mode: str,
-    displays: tuple[str, ...],
+@pytest.mark.parametrize("axis", ["horizontal", "vertical"])
+def test_adding_tag_transfers_dimension_to_other_axis(
+    da: sc.DataArray, axis: str
 ) -> None:
-    config = _DimensionConfig(
-        "tube",
-        size=da.sizes["tube"],
-        coord=da.coords["tube"],
-        settings=SLICE if mode == "flatten" else flat("vertical"),
-    )
-    config._mode_button.value = mode
-    assert (
-        tuple(
-            widget.layout.display
-            for widget in (config._slicer, config._axis, config._primary)
-        )
-        == displays
+    configs = _DimensionConfigs(da)
+    target = getattr(configs, axis)
+    source = configs.vertical if axis == "horizontal" else configs.horizontal
+    dim = source.value[0]
+    target.value = [*target.value, dim]
+    assert dim not in source.value
+    assert dim not in configs.axis_layout.sliced
+    assert configs._slicers_box.children == ()
+
+
+@pytest.mark.parametrize("axis", ["horizontal", "vertical"])
+def test_axis_tags_reject_unknown_dimensions(da: sc.DataArray, axis: str) -> None:
+    configs = _DimensionConfigs(da)
+    before = configs.axis_layout
+    with pytest.raises(TraitError):
+        getattr(configs, axis).value = ["unknown"]
+    assert configs.axis_layout == before
+
+
+@pytest.mark.parametrize("axis", ["horizontal", "vertical"])
+def test_axis_tags_deduplicate_programmatic_values(da: sc.DataArray, axis: str) -> None:
+    configs = _DimensionConfigs(da)
+    tags = getattr(configs, axis)
+    assert tags.allow_duplicates is False
+    tags.value = ["arc", "arc"]
+    assert tags.value == ["arc"]
+
+
+def test_unassigned_dimensions_show_sliders_and_keep_their_values(
+    da: sc.DataArray,
+) -> None:
+    configs = _DimensionConfigs(da)
+    slice_dim(configs, "tube")
+    slicer = configs.slicers["tube"]
+    assert configs._slicers_box.children == (slicer,)
+    slicer.slider.value = (1, 2)
+    configs.horizontal.value = ["tube", *configs.horizontal.value]
+    assert configs._slicers_box.children == ()
+    slice_dim(configs, "tube")
+    assert configs._slicers_box.children == (slicer,)
+    assert configs.state_node().slices == {"tube": (1, 2)}
+
+
+def test_slider_order_does_not_omit_unspecified_dimensions(da: sc.DataArray) -> None:
+    configs = _DimensionConfigs(da, dims=["tube", "arc"])
+    configs.horizontal.value = []
+    configs.vertical.value = []
+    assert configs.axis_layout.sliced == ("tube", "arc", "channel", "length")
+    assert configs._slicers_box.children == tuple(
+        configs.slicers[dim] for dim in configs.axis_layout.sliced
     )
 
 
-@pytest.mark.parametrize("axis", ["vertical", "horizontal"])
-def test_dimension_configs_initial_settings_get_fixed_to_satisfy_constraints(
-    da: sc.DataArray,
-    axis: str,
-) -> None:
-    settings = {dim: flat(axis, primary=True) for dim in da.dims}
-    configs = _DimensionConfigs(da, settings=settings)
-    assert_valid_axes(configs)
-
-
-def test_moving_slider_emits_only_slider_event(da: sc.DataArray) -> None:
-    configs = _DimensionConfigs(da)
-    set_mode(configs, "tube", "slice")
-    events = record_events(configs)
-    configs["tube"]._slicer.slider.value = (1, 2)
-    assert events == {"slider": ["tube"], "config": []}
-
-
-@pytest.mark.parametrize("change", ["axis", "mode"])
-def test_moving_last_dim_off_an_axis_moves_another_dim_there(
-    da: sc.DataArray,
-    change: str,
-) -> None:
-    configs = _DimensionConfigs(da)
-    (horizontal,) = [
-        dim for dim, s in configs.settings.items() if s.axis == "horizontal"
-    ]
-    events = record_events(configs)
-
-    if change == "axis":
-        configs[horizontal].axis = "vertical"
-        assert configs[horizontal].axis == "vertical"  # The user's choice is kept.
-    else:
-        set_mode(configs, horizontal, "slice")
-        assert configs[horizontal].mode == "slice"
-    assert_valid_axes(configs)
-    assert events == {"slider": [], "config": [horizontal]}  # One event per action.
-
-
-def test_switching_dim_to_flatten_mode_fills_empty_axis(da: sc.DataArray) -> None:
-    settings = {
-        "arc": flat("vertical", primary=True),
-        "channel": SLICE,
-        "tube": SLICE,
-        "length": SLICE,
-    }
-    configs = _DimensionConfigs(da, settings=settings)
-    set_mode(configs, "tube", "flatten")
-    # Moves the dim that was just switched, not the existing one.
-    assert summarize(configs)["arc"] == ("vertical", True)
-    assert summarize(configs)["tube"] == ("horizontal", True)
-
-
-@pytest.mark.parametrize(
-    ("dim", "checked", "primary", "config_events"),
-    [
-        pytest.param("channel", True, "channel", ["channel"], id="replace-primary"),
-        pytest.param("arc", False, "arc", [], id="revert-unchecking-only-primary"),
-    ],
-)
-def test_primary_changes_preserve_one_primary_and_emit_only_effective_changes(
-    da: sc.DataArray,
-    dim: str,
-    checked: bool,
-    primary: str,
-    config_events: list[str],
-) -> None:
-    settings = {
-        "arc": flat("vertical", primary=True),
-        "channel": flat("vertical"),
-        "tube": flat("vertical"),
-        "length": flat("horizontal", primary=True),
-    }
-    configs = _DimensionConfigs(da, settings=settings)
-    events = record_events(configs)
-    configs[dim].primary = checked
-    assert summarize(configs) == {
-        "arc": ("vertical", primary == "arc"),
-        "channel": ("vertical", primary == "channel"),
-        "tube": ("vertical", False),
-        "length": ("horizontal", True),
-    }
-    assert_valid_axes(configs)
-    assert events == {"slider": [], "config": config_events}
-
-
-def test_moving_primary_dim_to_other_axis_keeps_existing_primary(
-    da: sc.DataArray,
-) -> None:
-    settings = {
-        "arc": flat("vertical", primary=True),
-        "channel": flat("vertical"),
-        "tube": flat("horizontal"),
-        "length": flat("horizontal", primary=True),
-    }
-    configs = _DimensionConfigs(da, settings=settings)
-    configs["arc"].axis = "horizontal"
-    assert summarize(configs) == {
-        "arc": ("horizontal", False),
-        "channel": ("vertical", True),
-        "tube": ("horizontal", False),
-        "length": ("horizontal", True),
-    }
-
-
-def test_constraints_are_not_enforced_with_fewer_than_two_flattened_dims(
-    da: sc.DataArray,
-) -> None:
-    configs = _DimensionConfigs(da)
-    for dim in ("channel", "tube", "length"):
-        set_mode(configs, dim, "slice")
-    events = record_events(configs)
-    configs["arc"].axis = "horizontal"
-    assert configs["arc"].axis == "horizontal"
-    assert events["config"] == ["arc"]
-
-
-def test_graph_slider_move_only_reruns_slice_branch(da: sc.DataArray) -> None:
+def test_each_input_edit_emits_one_consistent_state(da: sc.DataArray) -> None:
     configs = _DimensionConfigs(da)
     calls = []
-
-    @pp.node
-    def use_settings(settings):
-        calls.append("settings")
-        return settings
-
-    @pp.node
-    def use_slices(settings, slices):
-        calls.append(("slices", slices))
-        return slices
-
-    sink = pp.Node(
-        lambda _: calls.append("sink"),
-        use_slices(use_settings(configs.settings_node), configs.slices_node),
-    )
+    sink = pp.Node(lambda state: calls.append(state), configs.state_node)
     sink()
-    assert calls == ["settings", ("slices", {}), "sink"]
-
     calls.clear()
-    set_mode(configs, "tube", "slice")
-    # Each node runs exactly once and sees the new slice.
-    assert calls == [
-        "settings",
-        ("slices", {"tube": configs["tube"].slider_value}),
-        "sink",
-    ]
 
-    calls.clear()
-    configs["tube"]._slicer.slider.value = (2, 2)
-    assert calls == [("slices", {"tube": (2, 2)}), "sink"]
+    for control, value in (
+        (configs.vertical, ["arc", "channel"]),
+        (configs.slicers["tube"].slider, (2, 2)),
+        (configs.horizontal, ["arc", "length"]),
+        (configs.horizontal, ["length", "arc"]),
+        (configs.vertical, ["tube", "channel"]),
+    ):
+        control.value = value
+        assert len(calls) == 1
+        state = calls.pop()
+        assert state.layout == configs.axis_layout
+        assert state.slices == {
+            dim: configs.slicers[dim].value for dim in state.layout.sliced
+        }
+        assert not set(state.layout.horizontal).intersection(state.layout.vertical)
 
-    calls.clear()
-    set_mode(configs, "tube", "flatten")
-    assert calls == ["settings", ("slices", {}), "sink"]
+
+def test_flatten_uses_tag_order_for_every_dimension(da: sc.DataArray) -> None:
+    configs = _DimensionConfigs(da)
+    node = pp.Node(_prepare_plot, da, configs.state_node)
+    configs.vertical.value = ["tube", "arc", "channel"]
+    expected = da.transpose(["tube", "arc", "channel", "length"]).flatten(
+        ["tube", "arc", "channel"], to="tube * arc * channel"
+    )
+    assert sc.identical(node(), expected)
+    # Reorder only non-leading tags: there is no special primary dimension.
+    configs.vertical.value = ["tube", "channel", "arc"]
+    expected = da.transpose(["tube", "channel", "arc", "length"]).flatten(
+        ["tube", "channel", "arc"], to="tube * channel * arc"
+    )
+    assert sc.identical(node(), expected)
 
 
 @view_test
-def test_view_shows_flattened_data(da: sc.DataArray) -> None:
-    view = FlatBankViewer(
-        da, horizontal=["length"], vertical=["channel", "arc", "tube"]
-    )
-    assert len(view.children) == 2  # No bank selector.
-    assert view.node().dims == ("channel * arc * tube", "length")
-    assert view._plot_data.sizes == {"vertical": 24, "horizontal": 5}
-    assert view._figure.canvas.ylabel == "channel * arc * tube"
-    assert view._figure.canvas.xlabel == "length"
-    expected = view.node().data.rename_dims(
-        {"channel * arc * tube": "vertical", "length": "horizontal"}
-    )
-    assert sc.identical(view._plot_data.data, expected)
-
-
-@view_test
-def test_view_updates_figure_in_place(da: sc.DataArray) -> None:
-    view = FlatBankViewer(da)
-    figure = view._figure
-
-    set_mode(view.configs, "tube", "slice")
-    assert view._figure is figure
-    assert "tube" not in view._figure.canvas.ylabel
-    assert "tube" not in view._figure.canvas.xlabel
-    assert math.prod(view._plot_data.shape) == 2 * 3 * 5
-
-    view.configs["tube"]._slicer.slider.value = (3, 3)
-    assert view._figure is figure
-    assert sc.identical(
-        view._plot_data.data.sum(),
-        da["tube", 3].data.sum(),
-    )
-
-
-@view_test
-def test_view_shows_message_with_fewer_than_two_flattened_dims(
+def test_initial_axis_order_is_used_and_unassigned_dimensions_are_sliced(
     da: sc.DataArray,
 ) -> None:
+    view = FlatBankViewer(da, horizontal=["length"], vertical=["channel", "arc"])
+    assert len(view.children) == 2
+    assert view.configs.axis_layout.sliced == ("tube",)
+    view.configs.slicers["tube"].slider.value = (1, 2)
+    expected = (
+        da["tube", 1:3]
+        .sum("tube")
+        .transpose(["channel", "arc", "length"])
+        .flatten(["channel", "arc"], to="channel * arc")
+    )
+    assert sc.identical(view.node(), expected)
+    assert view._plot_data.sizes == {"vertical": 6, "horizontal": 5}
+    assert view._figure.canvas.ylabel == "channel * arc"
+    assert view._figure.canvas.xlabel == "length"
+
+
+@view_test
+def test_explicit_sliced_dimensions_are_excluded_from_default_axes(da: sc.DataArray):
+    view = FlatBankViewer(da, sliced=["tube"])
+    assert view.configs.horizontal.value == ["length"]
+    assert view.configs.vertical.value == ["arc", "channel"]
+    assert view.configs.axis_layout.sliced == ("tube",)
+
+
+@view_test
+def test_view_updates_in_place_and_hover_follows_tag_order(da: sc.DataArray) -> None:
     view = FlatBankViewer(da)
-    for dim in ("channel", "tube", "length"):
-        set_mode(view.configs, dim, "slice")
+    figure = view._figure
+    slice_dim(view.configs, "tube")
+    view.configs.slicers["tube"].slider.value = (3, 3)
+    assert view._figure is figure
+    assert sc.identical(view._plot_data.data.sum(), da["tube", 3].data.sum())
+    view.configs.vertical.value = ["channel", "arc"]
+    assert view._figure is figure
+    assert view._figure.canvas.ylabel == "channel * arc"
+    # y=3 -> channel=1, arc=1 with the reordered tags.
+    text = view._figure.ax.format_coord(4.2, 3.2)
+    assert text.startswith("{Length: 4, Channel: 1, Arc: 1}: ")
+    expected = da["arc", 1]["channel", 1]["tube", 3]["length", 4].value
+    assert str(expected) in text
+    assert view._plot_data["vertical", 3]["horizontal", 4].value == expected
+
+
+@view_test
+@pytest.mark.parametrize("axis", ["horizontal", "vertical"])
+def test_reversing_axis_preserves_data_hover_and_zoom(
+    da: sc.DataArray, axis: str
+) -> None:
+    view = FlatBankViewer(da)
+    data = view.node()
+    plotted = view._plot_data
+    hover = view._format_coord(1, 2)
+    ax = view._figure.ax
+    ax.set_xlim(0.5, 3.5)
+    ax.set_ylim(1.5, 10.5)
+    control = getattr(view.configs, f"invert_{axis}")
+    control.value = True
+    assert ax.xaxis_inverted() == (axis == "horizontal")
+    assert ax.yaxis_inverted() == (axis == "vertical")
+    assert sorted(ax.get_xlim()) == [0.5, 3.5]
+    assert sorted(ax.get_ylim()) == [1.5, 10.5]
+    assert view.node() is data
+    assert view._plot_data is plotted
+    assert view._format_coord(1, 2) == hover
+    control.value = False
+    assert not ax.xaxis_inverted()
+    assert not ax.yaxis_inverted()
+
+
+def assert_figure_matches_inputs(view: FlatBankViewer, da: sc.DataArray) -> None:
+    configs = view.configs
+    if not configs.horizontal.value or not configs.vertical.value:
+        assert view._figure.layout.display == "none"
+        return
+
+    # Compute an independent reference, slicing before transposing/reshaping.
+    expected = da.values.copy()
+    dims = list(da.dims)
+    for dim in configs.axis_layout.sliced:
+        start, stop = configs.slicers[dim].value
+        axis = dims.index(dim)
+        expected = np.take(expected, range(start, stop + 1), axis=axis).sum(axis=axis)
+        dims.remove(dim)
+    order = [*configs.vertical.value, *configs.horizontal.value]
+    expected = expected.transpose([dims.index(dim) for dim in order]).reshape(
+        math.prod(da.sizes[dim] for dim in configs.vertical.value), -1
+    )
+
+    # Check both the current artist and a fresh Plopp render, which must not
+    # restore the data from when the figure was first created.
+    for render in (False, True):
+        if render:
+            view._figure.view.render()
+        artist = view._figure.artists[view._figure_node.id]
+        np.testing.assert_array_equal(artist.data.values, expected)
+        reference = sc.DataArray(
+            sc.array(dims=["vertical", "horizontal"], values=expected, unit=da.unit)
+        )
+        np.testing.assert_allclose(
+            artist._image.get_array(), view._figure.view.colormapper.rgba(reference)
+        )
+        assert view._figure.canvas.xlabel == " * ".join(configs.horizontal.value)
+        assert view._figure.canvas.ylabel == " * ".join(configs.vertical.value)
+        assert view._figure.ax.xaxis_inverted() == configs.invert_horizontal.value
+        assert view._figure.ax.yaxis_inverted() == configs.invert_vertical.value
+
+
+@view_test
+def test_image_tracks_successive_input_changes_and_rerenders(da: sc.DataArray) -> None:
+    view = FlatBankViewer(da)
+    configs = view.configs
+    # set_state simulates widget updates received from the browser.
+    for control, value in (
+        (configs.vertical, ["tube", "arc", "channel"]),
+        (configs.horizontal, ["tube", "length"]),
+        (configs.horizontal, ["length", "tube"]),
+        (configs.vertical, ["arc"]),
+        (configs.slicers["channel"].slider, (1, 1)),
+        (configs.horizontal, ["length"]),
+        (configs.invert_horizontal, True),
+        (configs.invert_vertical, True),
+        (configs.vertical, []),
+        (configs.vertical, ["tube", "channel", "arc"]),
+        (configs.vertical, ["channel", "arc"]),
+    ):
+        control.set_state({"value": value})
+        assert_figure_matches_inputs(view, da)
+
+
+@view_test
+def test_unsupported_layout_hides_old_plot_and_recovers() -> None:
+    da = make_data(
+        ("sumo", "module", "segment", "counter", "wire", "strip", "tof"),
+        (2, 3, 2, 2, 2, 3, 4),
+    )
+    vertical = ["counter", "segment", "wire"]
+    view = FlatBankViewer(da, horizontal=["module", "strip", "sumo"], vertical=vertical)
+    assert_figure_matches_inputs(view, da)
+    with pytest.raises(RuntimeError, match="more than 6 dimensions"):
+        view.configs.vertical.value = [*vertical, "tof"]
+    assert view._figure.layout.display == "none"
+    assert view._plot_data is None
+    assert "Cannot display this layout" in view._message.value
+    assert "more than 6 dimensions" in view._message.value
+    assert view._message.layout.display is None
+
+    view.configs.vertical.value = vertical
+    assert view._figure.layout.display is None
+    assert view._message.layout.display == "none"
+    assert_figure_matches_inputs(view, da)
+
+
+@view_test
+def test_reversed_axes_survive_slicing_reordering_and_autoscale(da: sc.DataArray):
+    view = FlatBankViewer(da)
+    view.configs.invert_horizontal.value = True
+    view.configs.invert_vertical.value = True
+    slice_dim(view.configs, "tube")
+    view.configs.slicers["tube"].slider.value = (1, 1)
+    view.configs.vertical.value = ["channel", "arc"]
+    view._figure.view.fit_to_data()
+    assert view._figure.ax.get_xlim() == (4.5, -0.5)
+    assert view._figure.ax.get_ylim() == (5.5, -0.5)
+    view.configs.horizontal.value = []
+    view.configs.horizontal.value = ["length"]
+    assert view._figure.ax.xaxis_inverted()
+    assert view._figure.ax.yaxis_inverted()
+
+
+@view_test
+def test_axis_directions_can_be_set_before_figure_exists(da: sc.DataArray):
+    view = FlatBankViewer(da, sliced=da.dims)
+    view.configs.invert_horizontal.value = True
+    view.configs.invert_vertical.value = True
+    view.configs.horizontal.value = ["length"]
+    view.configs.vertical.value = ["arc"]
+    assert view._figure.ax.xaxis_inverted()
+    assert view._figure.ax.yaxis_inverted()
+
+
+@view_test
+@pytest.mark.parametrize("axis", ["horizontal", "vertical"])
+def test_empty_axis_hides_plot_until_a_tag_is_added(
+    da: sc.DataArray, axis: str
+) -> None:
+    view = FlatBankViewer(da)
+    tags = getattr(view.configs, axis)
+    original = list(tags.value)
+    tags.value = []
     assert view.node() is None
     assert view._message.layout.display is None
     assert view._figure.layout.display == "none"
-
-    set_mode(view.configs, "length", "flatten")
+    tags.value = original
     assert view._message.layout.display == "none"
     assert view._figure.layout.display is None
 
 
 @view_test
-def test_view_hover_shows_indices_of_all_flattened_dims(da: sc.DataArray) -> None:
-    view = FlatBankViewer(
-        da, sliced=["tube"], horizontal=["length"], vertical=["channel", "arc"]
-    )
-    view.configs["tube"]._slicer.slider.value = (1, 1)
-    # x=4 -> length 4; y=5 -> channel 2, arc 1
-    text = view._format_coord(4.2, 4.8)
-    assert text.startswith("{Length: 4, Channel: 2, Arc: 1}: ")
-    expected = da["arc", 1]["channel", 2]["tube", 1]["length", 4].value
-    assert str(expected) in text
+def test_can_create_plot_after_starting_with_all_dimensions_sliced(da: sc.DataArray):
+    view = FlatBankViewer(da, sliced=da.dims)
+    assert view._figure is None
+    assert view._message.layout.display is None
+    view.configs.horizontal.value = ["length"]
+    assert view._figure is None
+    view.configs.vertical.value = ["arc"]
+    assert view._figure is not None
+    assert view.node().dims == ("arc", "length")
+    assert view._message.layout.display == "none"
 
 
 @view_test
 @pytest.mark.parametrize(("x", "y"), [(-1, 0), (5, 0), (0, -1), (0, 6)])
 def test_view_hover_outside_data_is_empty(da: sc.DataArray, x: float, y: float) -> None:
-    view = FlatBankViewer(
-        da, sliced=["tube"], horizontal=["length"], vertical=["channel", "arc"]
-    )
+    view = FlatBankViewer(da, horizontal=["length"], vertical=["channel", "arc"])
     assert view._format_coord(x, y) == ""
 
 
@@ -378,34 +404,50 @@ def bank_selector(view: FlatBankViewer):
 
 
 @view_test
-def test_view_with_data_group_switches_banks(banks: sc.DataGroup) -> None:
+def test_axis_directions_are_kept_per_bank(banks: sc.DataGroup):
+    view = FlatBankViewer(banks)
+    configs_a = view.configs
+    configs_a.invert_horizontal.value = True
+    bank_selector(view).value = "b"
+    assert not view._figure.ax.xaxis_inverted()
+    assert not view._figure.ax.yaxis_inverted()
+    configs_a.invert_vertical.value = True
+    assert not view._figure.ax.yaxis_inverted()  # Inactive bank's update is ignored.
+    bank_selector(view).value = "a"
+    assert view._figure.ax.xaxis_inverted()
+    assert view._figure.ax.yaxis_inverted()
+
+
+@view_test
+def test_image_tracks_bank_switches_and_rerenders(banks: sc.DataGroup):
+    view = FlatBankViewer(banks)
+    view.configs.vertical.value = ["channel", "arc", "tube"]
+    for bank in ("b", "a", "c", "b", "a"):
+        bank_selector(view).value = bank
+        assert_figure_matches_inputs(view, banks[bank])
+
+
+@view_test
+def test_switching_banks_keeps_axis_order_and_slider_state(banks: sc.DataGroup) -> None:
     view = FlatBankViewer(banks)
     selector = bank_selector(view)
     assert list(selector.options) == ["a", "b", "c"]
     figure = view._figure
-
-    selector.value = "b"
-    assert view._configs_box.children == (view.configs,)
-    assert view._figure is figure
-    assert math.prod(view._plot_data.shape) == 6 * 7
-    assert {view._figure.canvas.xlabel, view._figure.canvas.ylabel} == {
-        "wire",
-        "strip",
-    }
-
-
-@view_test
-def test_view_with_data_group_keeps_settings_per_bank(banks: sc.DataGroup) -> None:
-    view = FlatBankViewer(banks)
-    selector = bank_selector(view)
-    set_mode(view.configs, "tube", "slice")
-    view.configs["tube"]._slicer.slider.value = (2, 2)
+    slice_dim(view.configs, "tube")
+    view.configs.slicers["tube"].slider.value = (2, 2)
+    view.configs.vertical.value = ["channel", "arc"]
     expected = view._plot_data
-
+    selector.value = "b"
+    assert view._figure is figure
+    assert view._configs_box.children == (view.configs,)
+    assert view._plot_data.sizes == {"vertical": 6, "horizontal": 7}
+    assert view.configs.horizontal.allowed_tags == ["wire", "strip"]
     selector.value = "c"
-    assert view.configs["tube"].mode == "flatten"
+    assert view.configs.axis_layout.sliced == ()
     selector.value = "a"
-    assert view.configs["tube"].mode == "slice"
+    assert view.configs.vertical.value == ["channel", "arc"]
+    assert view.configs.axis_layout.sliced == ("tube",)
+    assert view.configs.slicers["tube"].value == (2, 2)
     assert sc.identical(view._plot_data, expected)
 
 
@@ -417,41 +459,27 @@ def test_view_ignores_updates_from_other_banks(banks: sc.DataGroup) -> None:
     configs_b = view.configs
     selector.value = "a"
     shown = view._plot_data
-    set_mode(configs_b, "wire", "slice")
+    configs_b.vertical.value = []
     assert view._plot_data is shown
 
 
 @view_test
-def test_view_initial_layout_per_bank(banks: sc.DataGroup) -> None:
+def test_initial_layout_per_bank(banks: sc.DataGroup) -> None:
     view = FlatBankViewer(
         banks,
-        sliced=["tube"],
-        horizontal=["length", "strip"],
+        horizontal=["length", "strip", "pixel"],
         vertical=["channel", "arc", "wire"],
     )
-    assert summarize(view.configs) == {
-        "arc": ("vertical", False),
-        "channel": ("vertical", True),
-        "tube": "slice",
-        "length": ("horizontal", True),
-    }
-    assert view._figure.canvas.ylabel == "channel * arc"
-    assert view._figure.canvas.xlabel == "length"
-
+    assert view.configs.vertical.value == ["channel", "arc"]
+    assert view.configs.horizontal.value == ["length"]
+    assert view.configs.axis_layout.sliced == ("tube",)
     bank_selector(view).value = "b"
-    # The first listed dim that is in the bank is the primary.
-    assert summarize(view.configs) == {
-        "wire": ("vertical", True),
-        "strip": ("horizontal", True),
-    }
-
+    assert view.configs.vertical.value == ["wire"]
+    assert view.configs.horizontal.value == ["strip"]
     bank_selector(view).value = "c"
-    # 'pixel' is not listed and no listed horizontal dim is in the bank.
-    assert summarize(view.configs) == {
-        "arc": ("vertical", True),
-        "pixel": ("horizontal", True),
-        "tube": "slice",
-    }
+    assert view.configs.vertical.value == ["arc"]
+    assert view.configs.horizontal.value == ["pixel"]
+    assert view.configs.axis_layout.sliced == ("tube",)
 
 
 @pytest.mark.parametrize(
@@ -476,6 +504,29 @@ def test_view_rejects_invalid_layout(
 def test_view_rejects_empty_bank_mapping() -> None:
     with pytest.raises(ValueError, match="at least one data array"):
         FlatBankViewer({})
+
+
+@pytest.mark.parametrize("container", ["array", "dict", "data_group"])
+def test_empty_dimensions_are_rejected_before_selecting_any_bank(
+    da: sc.DataArray, container: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty = sc.DataArray(sc.zeros(sizes={"x": 2, "y": 0}))
+    if container == "array":
+        data = empty
+        message = r"Empty dimensions \['y'\] in data array"
+    else:
+        # The empty bank is not initially selected, but must still be checked.
+        data = {"good": da, "empty": empty}
+        if container == "data_group":
+            data = sc.DataGroup(data)
+        message = r"Empty dimensions \['y'\] in bank 'empty'"
+    monkeypatch.setattr(
+        FlatBankViewer,
+        "_select",
+        lambda *_: pytest.fail("Bank selected before validation"),
+    )
+    with pytest.raises(ValueError, match=message):
+        FlatBankViewer(data)
 
 
 def test_view_rejects_non_data_array_entries(banks: sc.DataGroup) -> None:

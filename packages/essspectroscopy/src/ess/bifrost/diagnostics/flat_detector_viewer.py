@@ -27,20 +27,25 @@ class FlatDetectorViewer(FlatBankViewer):
         ----------
         data:
             Histogrammed data, one entry per bank.
-            cbar:
-                Whether to show a colorbar.
+        cbar:
+            Whether to show a colorbar.
         rasterized:
             If ``True``, the figure is rasterized which improves rendering
             speed but reduces resolution.
         **kwargs:
             Additional arguments passed to :func:`plopp.imagefigure`.
         """
-        vertical = ("arc", "tube")
-        horizontal = ("channel", "length")
-        sliced = set(data.dims) - set(vertical) - set(horizontal)
+        dims = (
+            data.dims
+            if isinstance(data, sc.DataArray)
+            else {dim for bank in data.values() for dim in bank.dims}
+        )
+        vertical = tuple(dim for dim in ("arc", "tube") if dim in dims)
+        horizontal = tuple(dim for dim in ("channel", "length") if dim in dims)
+        sliced = tuple(dim for dim in dims if dim not in (*vertical, *horizontal))
         super().__init__(
             data,
-            dims=(*vertical, *horizontal, *sliced),
+            dims=(*vertical, *horizontal),
             sliced=sliced,
             vertical=vertical,
             horizontal=horizontal,

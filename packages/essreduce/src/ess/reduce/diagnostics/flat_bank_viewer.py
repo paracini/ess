@@ -6,7 +6,8 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Literal
+from html import escape
+from typing import Any
 
 import ipywidgets as ipw
 import plopp as pp
@@ -37,18 +38,18 @@ class FlatBankViewer(ipw.VBox):
         data:
             Data to show. A mapping (e.g., a data group) with one entry per bank
             adds buttons for selecting a bank. The banks may have different dims
-            but must all have the same unit.
+            but must all have the same unit and no empty dimensions.
         dims:
-            Order of the dimension controls. With multiple banks, dims that are not
+            Order of the slicing controls. With multiple banks, dims that are not
             in a bank are ignored for that bank.
         sliced:
             Dims that start in slice mode.
         horizontal:
             Dims that start flattened onto the horizontal axis.
-            The first one that is in a bank is the primary dim of that bank.
+            Order is outermost to innermost (last dim varies fastest).
         vertical:
             Dims that start flattened onto the vertical axis.
-            The first one that is in a bank is the primary dim of that bank.
+            Order is outermost to innermost (last dim varies fastest).
         cbar:
             Whether to show a colorbar.
         rasterized:
@@ -58,15 +59,31 @@ class FlatBankViewer(ipw.VBox):
             Additional arguments passed to :func:`plopp.imagefigure`.
 
         Dims that are not in a bank are ignored for that bank.
-        Dims that are in none of ``sliced``, ``horizontal``, and ``vertical`` use
-        default settings. Settings may get adjusted to ensure that both axes have
-        a dim, as long as at least two dims are flattened.
+        Dims on neither axis are sliced. If neither axis is specified, dims not
+        listed in ``sliced`` start on the vertical axis, except for the last dim,
+        which starts on the horizontal axis. Drag axis tags to reorder them;
+        adding a dim to one axis removes it from the other.
+        The direction controls reverse the displayed axes without changing the data.
+        Scipp may reject layouts with more than six unsliced dimensions. Failed
+        layouts show an error instead of leaving the previous plot visible.
         """
+        # Validate every bank before constructing any controls or figures, including
+        # banks that will only be displayed after the user changes the selection.
+        self._banks = _validate_banks(
+            {"": data} if isinstance(data, sc.DataArray) else data
+        )
+        self._dims = None if dims is None else tuple(dims)
+        self._layout = _validate_layout(
+            self._banks,
+            sliced=tuple(sliced),
+            horizontal=tuple(horizontal),
+            vertical=tuple(vertical),
+        )
         self._fig_kwargs = {"cbar": cbar, "rasterized": rasterized} | fig_kwargs
         self._figure = None
-        self._figure_key = None
+        self._figure_node = pp.Node(lambda: self._plot_data)
         self._message = ipw.HTML(
-            "Put at least two dims into flatten mode to show a plot.",
+            "Add at least one dimension to each axis to show a plot.",
             layout={"display": "none"},
         )
         self._figure_box = ipw.Box([self._message])
@@ -74,20 +91,11 @@ class FlatBankViewer(ipw.VBox):
         self._plot_data = None
         self._unwrap_indices = None
 
-        self._dims = None if dims is None else tuple(dims)
         if isinstance(data, sc.DataArray):
-            self._banks = {"": data}
             selector = None
         else:
-            self._banks = _validate_banks(data)
             selector = ipw.ToggleButtons(options=list(self._banks))
             selector.observe(lambda change: self._select(change["new"]), names="value")
-        self._layout = _validate_layout(
-            self._banks,
-            sliced=tuple(sliced),
-            horizontal=tuple(horizontal),
-            vertical=tuple(vertical),
-        )
         # Graphs and controls are created on first selection of a bank and kept
         # afterwards, so each bank keeps its settings.
         self._views: dict[str, _BankView] = {}
@@ -119,9 +127,15 @@ class FlatBankViewer(ipw.VBox):
             self._views[bank] = _BankView(
                 da,
                 dims,
-                _initial_settings(da.dims, **self._layout),
+                _initial_layout(da.dims, **self._layout),
                 partial(self._on_bank_data, bank),
+                partial(self._on_bank_error, bank),
             )
+            configs = self._views[bank].configs
+            for control in (configs.invert_horizontal, configs.invert_vertical):
+                control.observe(
+                    partial(self._update_axis_directions, bank), names="value"
+                )
         view = self._views[bank]
         self._configs_box.children = [view.configs]
         # The sink does not cache (`_on_bank_data` returns None), so this calls
@@ -131,13 +145,26 @@ class FlatBankViewer(ipw.VBox):
     def _on_bank_data(self, bank: str, data: sc.DataArray | None) -> None:
         # Only the current bank's controls are visible, but be defensive anyway.
         if bank == self._current:
-            self._show(data)
+            try:
+                self._show(data)
+            except Exception as error:
+                self._on_bank_error(bank, error)
+                raise
+
+    def _on_bank_error(self, bank: str, error: Exception) -> None:
+        if bank == self._current:
+            self._hide_figure(f"Cannot display this layout: {error}")
+
+    def _hide_figure(self, message: str) -> None:
+        self._message.value = escape(message)
+        self._message.layout.display = None
+        self._plot_data = None
+        if self._figure is not None:
+            self._figure.layout.display = "none"
 
     def _show(self, data: sc.DataArray | None) -> None:
         if data is None:
-            self._message.layout.display = None
-            if self._figure is not None:
-                self._figure.layout.display = "none"
+            self._hide_figure("Add at least one dimension to each axis to show a plot.")
             return
         self._message.layout.display = "none"
 
@@ -146,7 +173,8 @@ class FlatBankViewer(ipw.VBox):
         self._plot_data = data
         # Same order as used by `flatten`.
         sizes = self._views[self._current].sizes
-        _, vertical, horizontal = _sort_dims(sizes, self.configs.settings)
+        layout = self.configs.axis_layout
+        vertical, horizontal = layout.vertical, layout.horizontal
         self._unwrap_indices = _unwrap_flat_indices_2d(
             {dim: sizes[dim] for dim in horizontal},
             {dim: sizes[dim] for dim in vertical},
@@ -155,28 +183,44 @@ class FlatBankViewer(ipw.VBox):
         # Replacing the figure widget makes the frontend re-create the canvas, which
         # flickers and shifts the layout. So use a single figure and modify that.
         if self._figure is None:
-            input_node = pp.Node(data)
-            self._figure = pp.imagefigure(input_node, **self._fig_kwargs)
-            self._figure_key = input_node.id
+            self._figure = pp.imagefigure(self._figure_node, **self._fig_kwargs)
             self._figure_box.children = [self._message, self._figure]
             # Must come after the figure's first update, which sets Plopp's formatter.
             self._figure.ax.format_coord = self._format_coord
         else:
             self._figure.layout.display = None
-            artist = self._figure.artists[self._figure_key]
+            artist = self._figure.artists[self._figure_node.id]
             if artist.data.shape != data.shape:
                 # Plopp's image artists cannot change their shape; replace the artist.
-                self._figure.artists.pop(self._figure_key).remove()
+                self._figure.artists.pop(self._figure_node.id).remove()
                 # Plopp does not unregister this when removing an artist.
                 self._figure.canvas._coord_formatters.remove(artist.format_coord)
 
         self._figure.canvas.xlabel = horizontal_dim
         self._figure.canvas.ylabel = vertical_dim
-        # Re-creates the artist if it was removed above and redraws the canvas.
-        self._figure.update({self._figure_key: data})
+        # Update through the graph so later renders also use the current data.
+        # This re-creates the artist if it was removed above and redraws the canvas.
+        self._figure_node.notify_children("data changed")
+        self._update_axis_directions(self._current)
+
+    def _update_axis_directions(self, bank: str, *_args: Any) -> None:
+        if bank != self._current or self._figure is None:
+            return
+        changed = False
+        for axis, control in (
+            (self._figure.ax.xaxis, self.configs.invert_horizontal),
+            (self._figure.ax.yaxis, self.configs.invert_vertical),
+        ):
+            if axis.get_inverted() != control.value:
+                axis.set_inverted(control.value)
+                changed = True
+        if changed:
+            self._figure.canvas.draw()
 
     def _format_coord(self, x: float, y: float) -> str:
         """Show the indices of all flattened dims and the value under the cursor."""
+        if self._plot_data is None:
+            return ""
         # Use round because axis coords are in the middle of bins.
         i, j = round(x), round(y)
         n_vertical, n_horizontal = self._plot_data.shape
@@ -198,14 +242,23 @@ class _BankView:
         self,
         da: sc.DataArray,
         dims: Iterable[str] | None,
-        settings: Mapping[str, "_DimensionSettings"],
+        layout: "_DimensionLayout",
         on_data: Callable[[sc.DataArray | None], None],
+        on_error: Callable[[Exception], None],
     ) -> None:
         self.sizes = dict(da.sizes)
-        self.configs = _DimensionConfigs(da, dims, settings)
-        self.node = _apply_slices(
-            _flatten(pp.Node(da), self.configs.settings_node), self.configs.slices_node
-        )
+        self.configs = _DimensionConfigs(da, dims, layout)
+
+        def compute(state: "_DimensionState") -> sc.DataArray | None:
+            try:
+                return _prepare_plot(da, state)
+            except Exception as error:
+                # Notebook callback tracebacks can be hidden. Never leave the
+                # previous bank/layout visible when the computation failed.
+                on_error(error)
+                raise
+
+        self.node = pp.Node(compute, self.configs.state_node)
         # Leaf node: Plopp calls it with new data whenever anything upstream changes.
         self.sink = pp.Node(on_data, self.node)
 
@@ -219,6 +272,9 @@ def _validate_banks(data: Mapping[str, Any]) -> dict[str, sc.DataArray]:
                 f"Expected all entries to be data arrays, got {type(value).__name__} "
                 f"for '{key}'."
             )
+        if empty := [dim for dim, size in value.sizes.items() if size == 0]:
+            name = f"bank {key!r}" if key else "data array"
+            raise ValueError(f"Empty dimensions {empty} in {name}.")
     return dict(data)
 
 
@@ -241,27 +297,38 @@ def _validate_layout(
     return {"sliced": sliced, "horizontal": horizontal, "vertical": vertical}
 
 
-def _initial_settings(
+@dataclass(frozen=True, slots=True)
+class _DimensionLayout:
+    sliced: tuple[str, ...]
+    vertical: tuple[str, ...]
+    horizontal: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DimensionState:
+    layout: _DimensionLayout
+    slices: dict[str, tuple[int, int]]
+
+
+def _initial_layout(
     dims: Iterable[str],
     *,
     sliced: tuple[str, ...],
     horizontal: tuple[str, ...],
     vertical: tuple[str, ...],
-) -> dict[str, "_DimensionSettings"]:
-    """Settings for the listed dims that are in ``dims``."""
-    dims = set(dims)
-    settings = {
-        dim: _DimensionSettings(mode="slice", axis="vertical", primary=False)
-        for dim in sliced
-        if dim in dims
-    }
-    for axis, axis_dims in (("horizontal", horizontal), ("vertical", vertical)):
-        present = [dim for dim in axis_dims if dim in dims]
-        for i, dim in enumerate(present):
-            settings[dim] = _DimensionSettings(
-                mode="flatten", axis=axis, primary=i == 0
-            )
-    return settings
+) -> _DimensionLayout:
+    dims = tuple(dims)
+    if not horizontal and not vertical:
+        flattened = tuple(dim for dim in dims if dim not in sliced)
+        vertical, horizontal = flattened[:-1], flattened[-1:]
+    else:
+        horizontal = tuple(dim for dim in horizontal if dim in dims)
+        vertical = tuple(dim for dim in vertical if dim in dims)
+    return _DimensionLayout(
+        sliced=tuple(dim for dim in dims if dim not in (*horizontal, *vertical)),
+        vertical=vertical,
+        horizontal=horizontal,
+    )
 
 
 def _to_plot_data(da: sc.DataArray) -> sc.DataArray:
@@ -278,318 +345,147 @@ def _to_plot_data(da: sc.DataArray) -> sc.DataArray:
     )
 
 
-# Called with the DimensionConfig that changed and the traitlets change dict.
-_DimensionCallback = Callable[["_DimensionConfig", dict[str, Any]], None]
-
-
-@dataclass(frozen=True, slots=True)
-class _DimensionSettings:
-    mode: Literal["flatten", "slice"]
-    axis: Literal["vertical", "horizontal"]
-    primary: bool
-
-
-_DEFAULT_SETTINGS = _DimensionSettings(mode="flatten", axis="vertical", primary=False)
-
-
-class _DimensionConfig(ipw.HBox):
-    def __init__(
-        self,
-        dim: str,
-        size: int,
-        coord: sc.Variable,
-        settings: _DimensionSettings = _DEFAULT_SETTINGS,
-    ) -> None:
-        self.dim = dim
-        self._slider_change_handlers = ipw.CallbackDispatcher()
-        self._config_change_handlers = ipw.CallbackDispatcher()
-
-        self._mode_button = ipw.ToggleButtons(
-            options=["flatten", "slice"],
-            value=settings.mode,
-            style={"button_width": "9ch"},
-            layout=ipw.Layout(width="max-content", margin="0 1em 0 0.5em"),
-        )
-        self._slicer = CombinedSlicer(dim=dim, size=size, coord=coord)
-        # DimensionConfig shows its own dim label.
-        self._slicer.int_slicer.dim_label.layout.display = "none"
-        self._slicer.range_slicer.dim_label.layout.display = "none"
-        self._axis = ipw.RadioButtons(
-            options=["vertical", "horizontal"],
-            value=settings.axis,
-            description="axis",
-        )
-        self._axis.add_class("sc-horizontal-radio")
-        self._primary = ipw.Checkbox(
-            value=settings.primary, description="Primary", indent=False
-        )
-
-        self._mode_button.observe(self._on_mode_switch, names="value")
-        # `CombinedSlicer.slider` is always the range slider; in single-handle mode
-        # the single slider drives it as `(i, i)`, so this catches both modes as well
-        # as edits in the text boxes.
-        self._slicer.slider.observe(self._emit_slider_change, names="value")
-        self._axis.observe(self._emit_config_change, names="value")
-        self._primary.observe(self._emit_config_change, names="value")
-        self._update_visibility()
-
-        label = ipw.Label(dim, layout=ipw.Layout(width="10ch"))
-
-        style = ipw.HTML(
-            """
-<style>
-.sc-horizontal-radio .widget-radio-box {
-    flex-direction: row !important;
-    padding: 0 !important;
-    margin: 0 !important;
-}
-.sc-horizontal-radio .widget-radio-box label {
-    margin-right: 10px;
-    height: auto !important;
-    line-height: normal !important;
-}
-.sc-horizontal-radio.widget-radio {
-    width: unset !important;
-}
-.sc-horizontal-radio > label {
-    display: none;
-}
-</style>
-""",
-            layout={"display": "none"},
-        )
-        super().__init__(
-            [
-                style,
-                label,
-                self._mode_button,
-                self._slicer,
-                self._axis,
-                self._primary,
-            ],
-            layout=ipw.Layout(align_items="center"),
-        )
-
-    def _update_visibility(self) -> None:
-        slicing = self.mode == "slice"
-        self._slicer.layout.display = "flex" if slicing else "none"
-        self._axis.layout.display = self._primary.layout.display = (
-            "none" if slicing else "flex"
-        )
-
-    def _on_mode_switch(self, change: dict[str, Any]) -> None:
-        self._update_visibility()
-        self._emit_config_change(change)
-
-    @property
-    def mode(self) -> Literal["flatten", "slice"]:
-        return self._mode_button.value
-
-    @property
-    def slider_value(self) -> tuple[int, int]:
-        """Inclusive index range ``(start, stop)``; ``(i, i)`` in single-handle mode."""
-        return self._slicer.value
-
-    @property
-    def axis(self) -> Literal["vertical", "horizontal"]:
-        return self._axis.value
-
-    @axis.setter
-    def axis(self, value: Literal["vertical", "horizontal"]) -> None:
-        self._axis.value = value
-
-    @property
-    def primary(self) -> bool:
-        return self._primary.value
-
-    @primary.setter
-    def primary(self, value: bool) -> None:
-        self._primary.value = value
-
-    @property
-    def settings(self) -> _DimensionSettings:
-        return _DimensionSettings(mode=self.mode, axis=self.axis, primary=self.primary)
-
-    def on_slider_change(
-        self, callback: _DimensionCallback, remove: bool = False
-    ) -> None:
-        """Register a callback for (cheap) slider moves."""
-        self._slider_change_handlers.register_callback(callback, remove=remove)
-
-    def on_config_change(
-        self, callback: _DimensionCallback, remove: bool = False
-    ) -> None:
-        """Register a callback for any other (expensive) configuration change."""
-        self._config_change_handlers.register_callback(callback, remove=remove)
-
-    def _emit_slider_change(self, change: dict[str, Any]) -> None:
-        self._slider_change_handlers(self, change)
-
-    def _emit_config_change(self, change: dict[str, Any]) -> None:
-        self._config_change_handlers(self, change)
-
-
-class _UncachedNode(pp.Node):
-    """Input node that re-evaluates ``func`` on every request instead of caching."""
-
-    def request_data(self) -> Any:
-        return self.func()
-
-
 class _DimensionConfigs(ipw.VBox):
+    """Ordered axis tags and persistent sliders for unassigned dimensions."""
+
     def __init__(
         self,
         da: sc.DataArray,
         dims: Iterable[str] | None = None,
-        settings: Mapping[str, _DimensionSettings] | None = None,
+        layout: _DimensionLayout | None = None,
     ) -> None:
-        """Create controls for the dims of ``da``.
-
-        ``settings`` holds the initial settings; dims without an entry use the
-        defaults. These may get adjusted to fulfill the constraints, e.g., to
-        ensure both axes have a dim.
-        """
-        self._slider_change_handlers = ipw.CallbackDispatcher()
-        self._config_change_handlers = ipw.CallbackDispatcher()
-
-        dims = da.dims if dims is None else dims
-        settings = {} if settings is None else settings
-        self._configs = {
-            dim: _DimensionConfig(
-                dim,
-                size=da.sizes[dim],
-                coord=_slicer_coord(da, dim),
-                settings=settings.get(dim, _DEFAULT_SETTINGS),
+        # ``dims`` orders the sliders; it must not hide dimensions from the controls.
+        self._dims = tuple(dict.fromkeys((*(() if dims is None else dims), *da.dims)))
+        if layout is None:
+            layout = _initial_layout(da.dims, sliced=(), horizontal=(), vertical=())
+        self.horizontal = ipw.TagsInput(
+            value=list(layout.horizontal),
+            allowed_tags=list(da.dims),
+            allow_duplicates=False,
+            placeholder="Add dimension",
+        )
+        self.vertical = ipw.TagsInput(
+            value=list(layout.vertical),
+            allowed_tags=list(da.dims),
+            allow_duplicates=False,
+            placeholder="Add dimension",
+        )
+        self.invert_horizontal = ipw.Checkbox(
+            description="Right to left",
+            indent=False,
+            layout=ipw.Layout(width="10em", flex="0 0 auto"),
+        )
+        self.invert_vertical = ipw.Checkbox(
+            description="Top to bottom",
+            indent=False,
+            layout=ipw.Layout(width="10em", flex="0 0 auto"),
+        )
+        for tags in (self.horizontal, self.vertical):
+            tags.add_class("ess-flat-bank-axis")
+            tags.tooltip = "Type a dimension name and press Enter to add it."
+            tags.layout = ipw.Layout(flex="1 1 auto", width="auto", min_width="0")
+        self.slicers = {
+            dim: CombinedSlicer(
+                dim=dim, size=da.sizes[dim], coord=_slicer_coord(da, dim)
             )
-            for dim in dims
+            for dim in self._dims
         }
-        for config in self._configs.values():
-            config.on_slider_change(self._slider_change_handlers)
-            config.on_config_change(self._on_child_config_change)
+        self._slicers_box = ipw.VBox()
+        self._updating = False
 
-        # Set while `_enforce_constraints` modifies child widgets, to suppress the
-        # events those modifications would otherwise emit.
-        self._enforcing = False
-        self._enforce_constraints(source=None, widget=None)
-        self._last_settings = self._get_settings()
+        # One snapshot per edit keeps axis order and slice ranges consistent.
+        self.state_node = pp.Node(self._get_state)
+        self.state_node.pretty_name = "DimensionConfigs"
+        for dim, slicer in self.slicers.items():
+            slicer.slider.observe(partial(self._on_slider_change, dim), names="value")
+        self.horizontal.observe(self._on_tags_change, names="value")
+        self.vertical.observe(self._on_tags_change, names="value")
+        self._update_slicers()
 
-        # Two separate graph inputs so that slider moves only invalidate the
-        # nodes downstream of `slices_node`; Plopp's per-node cache keeps the
-        # (expensive) results downstream of `settings_node` intact.
-        # `slices_node` must not cache: its value depends on the modes, but mode
-        # switches only notify `settings_node` (notifying both would make shared
-        # children run twice). Its children still get re-run via `settings_node`.
-        self.slices_node = _UncachedNode(self._get_slices)
-        self.slices_node.pretty_name = "DimensionConfigs <slices>"
-        self.settings_node = pp.Node(self._get_settings)
-        self.settings_node.pretty_name = "DimensionConfigs <settings>"
-        self.on_slider_change(
-            lambda _, change: self.slices_node.notify_children(change)
+        super().__init__(
+            [
+                self._axis_row("X axis", self.horizontal, self.invert_horizontal),
+                self._axis_row("Y axis", self.vertical, self.invert_vertical),
+                ipw.HTML(
+                    # TagsInput hides its input wrapper on blur and after updates.
+                    # Scope this override to our axis controls, including when full.
+                    """
+<style>
+.ess-flat-bank-axis > .widget-text {
+    display: inline-block !important;
+}
+.ess-flat-bank-axis .jupyter-widget-taginput {
+    border: 1px dashed var(--jp-border-color1, #999);
+    border-radius: 3px;
+    min-width: 14ch;
+}
+.ess-flat-bank-axis .jupyter-widget-taginput:focus {
+    border-style: solid;
+    border-color: var(--jp-brand-color1, #2196f3);
+}
+</style>
+"""
+                    "Type a dimension name and press Enter to add it. "
+                    "Drag tags to reorder (last dimension varies fastest). "
+                    "Dimensions on neither axis are sliced below."
+                ),
+                self._slicers_box,
+            ]
         )
-        self.on_config_change(
-            lambda _, change: self.settings_node.notify_children(change)
+
+    @staticmethod
+    def _axis_row(label: str, tags: ipw.TagsInput, reverse: ipw.Checkbox) -> ipw.HBox:
+        # TagsInput does not render its description, so use an explicit label.
+        return ipw.HBox(
+            [
+                ipw.Label(label, layout=ipw.Layout(width="4em", flex="0 0 auto")),
+                reverse,
+                tags,
+            ],
+            layout=ipw.Layout(align_items="center"),
         )
-
-        super().__init__(list(self._configs.values()))
-
-    def __getitem__(self, dim: str) -> _DimensionConfig:
-        return self._configs[dim]
 
     @property
-    def settings(self) -> dict[str, _DimensionSettings]:
-        return self._get_settings()
+    def axis_layout(self) -> _DimensionLayout:
+        horizontal, vertical = tuple(self.horizontal.value), tuple(self.vertical.value)
+        return _DimensionLayout(
+            sliced=tuple(
+                dim for dim in self._dims if dim not in (*horizontal, *vertical)
+            ),
+            vertical=vertical,
+            horizontal=horizontal,
+        )
 
-    def on_slider_change(
-        self, callback: _DimensionCallback, remove: bool = False
-    ) -> None:
-        """Register a callback for slider moves in any child."""
-        self._slider_change_handlers.register_callback(callback, remove=remove)
+    def _get_state(self) -> _DimensionState:
+        layout = self.axis_layout
+        return _DimensionState(
+            layout=layout,
+            slices={dim: self.slicers[dim].value for dim in layout.sliced},
+        )
 
-    def on_config_change(
-        self, callback: _DimensionCallback, remove: bool = False
-    ) -> None:
-        """Register a callback for any non-slider change in any child."""
-        self._config_change_handlers.register_callback(callback, remove=remove)
+    def _update_slicers(self) -> None:
+        self._slicers_box.children = [
+            self.slicers[dim] for dim in self.axis_layout.sliced
+        ]
 
-    def _get_slices(self) -> dict[str, tuple[int, int]]:
-        return {
-            dim: config.slider_value
-            for dim, config in self._configs.items()
-            if config.mode == "slice"
-        }
+    def _on_slider_change(self, dim: str, change: dict[str, Any]) -> None:
+        if dim in self.axis_layout.sliced:
+            self.state_node.notify_children(change)
 
-    def _get_settings(self) -> dict[str, _DimensionSettings]:
-        return {dim: config.settings for dim, config in self._configs.items()}
-
-    def _on_child_config_change(
-        self, config: _DimensionConfig, change: dict[str, Any]
-    ) -> None:
-        if self._enforcing:
-            # Caused by `_enforce_constraints`; the outer call emits the event.
+    def _on_tags_change(self, change: dict[str, Any]) -> None:
+        if self._updating:
             return
-        self._enforce_constraints(source=config, widget=change["owner"])
-        settings = self._get_settings()
-        if settings == self._last_settings:
-            # E.g., the user unchecked the only primary dim of an axis, and it got
-            # re-checked.
-            return
-        self._last_settings = settings
-        self._config_change_handlers(config, change)
-
-    def _enforce_constraints(
-        self, source: _DimensionConfig | None, widget: ipw.Widget | None
-    ) -> None:
-        """Ensure there is at least one dim on each axis and exactly one primary dim
-        per axis.
-
-        Only applies when at least two dims are in flatten mode.
-        ``source`` and ``widget`` identify the user's change, which takes precedence
-        over the state of other dims.
-        """
-        flat = [c for c in self._configs.values() if c.mode == "flatten"]
-        if len(flat) < 2:
-            return
-        user_axis = source is not None and widget is source._axis
-        user_mode = source is not None and widget is source._mode_button
-        user_primary = source is not None and widget is source._primary
-
-        self._enforcing = True
+        edited = change["owner"]
+        other = self.vertical if edited is self.horizontal else self.horizontal
+        self._updating = True
         try:
-            for axis in ("vertical", "horizontal"):
-                if not any(c.axis == axis for c in flat):
-                    # Never undo the axis the user just picked. But prefer moving a
-                    # dim that was just switched to flatten mode.
-                    candidates = [c for c in flat if not (user_axis and c is source)]
-                    preferred = source if user_mode else None
-                    _choose_dim_to_move(candidates, preferred).axis = axis
-
-            for axis in ("vertical", "horizontal"):
-                group = [c for c in flat if c.axis == axis]
-                if user_primary and source in group:
-                    # Checked: takes over from the previous primary.
-                    # Unchecked: gets re-checked, like a radio button.
-                    keep = source
-                else:
-                    # Keep the existing primary over one brought in by `source`,
-                    # e.g., by moving a primary dim to this axis.
-                    primaries = [c for c in group if c.primary]
-                    keep = next(
-                        (c for c in primaries if c is not source),
-                        (primaries or group)[0],
-                    )
-                for c in group:
-                    c.primary = c is keep
+            # TagsInput prevents duplicates in the frontend, but not in Python.
+            edited.value = list(dict.fromkeys(edited.value))
+            other.value = [dim for dim in other.value if dim not in edited.value]
+            self._update_slicers()
         finally:
-            self._enforcing = False
-
-
-def _choose_dim_to_move(
-    candidates: list[_DimensionConfig], preferred: _DimensionConfig | None
-) -> _DimensionConfig:
-    if preferred in candidates:
-        return preferred
-    non_primary = [c for c in candidates if not c.primary]
-    return (non_primary or candidates)[-1]
+            self._updating = False
+        self.state_node.notify_children(change)
 
 
 def _slicer_coord(da: sc.DataArray, dim: str) -> sc.Variable:
@@ -599,50 +495,25 @@ def _slicer_coord(da: sc.DataArray, dim: str) -> sc.Variable:
     return sc.arange(dim, da.sizes[dim], unit=None)
 
 
-@pp.node
-def _flatten(
-    da: sc.DataArray, settings: Mapping[str, _DimensionSettings]
-) -> sc.DataArray | None:
-    sliced, vertical, horizontal = _sort_dims(da.dims, settings)
-    if not vertical or not horizontal:
-        # Fewer than two dims in flatten mode; nothing to plot.
+def _prepare_plot(da: sc.DataArray, state: _DimensionState) -> sc.DataArray | None:
+    if not state.layout.vertical or not state.layout.horizontal:
         return None
+    # Reduce dimensionality before transpose/flatten: Scipp cannot copy some
+    # non-contiguous arrays with more than six dimensions (e.g. DREAM + tof).
+    return _flatten(_apply_slices(da, state.slices), state.layout)
 
+
+def _flatten(da: sc.DataArray, layout: _DimensionLayout) -> sc.DataArray:
     return (
-        da.transpose([*sliced, *vertical, *horizontal])
-        .flatten(horizontal, to=" * ".join(horizontal))
-        .flatten(vertical, to=" * ".join(vertical))
+        da.transpose([*layout.vertical, *layout.horizontal])
+        .flatten(layout.horizontal, to=" * ".join(layout.horizontal))
+        .flatten(layout.vertical, to=" * ".join(layout.vertical))
     )
 
 
-def _sort_dims(
-    reference_dims: Iterable[str], settings: Mapping[str, _DimensionSettings]
-) -> tuple[list[str], list[str], list[str]]:
-    sliced = []
-    vertical = []
-    horizontal = []
-    # Preserve order in da for cheaper transpose
-    for dim in reference_dims:
-        match settings[dim]:
-            case _DimensionSettings(mode="slice"):
-                sliced.append(dim)
-            case _DimensionSettings(axis="vertical", primary=False):
-                vertical.append(dim)
-            case _DimensionSettings(axis="vertical", primary=True):
-                vertical.insert(0, dim)
-            case _DimensionSettings(axis="horizontal", primary=False):
-                horizontal.append(dim)
-            case _DimensionSettings(axis="horizontal", primary=True):
-                horizontal.insert(0, dim)
-    return sliced, vertical, horizontal
-
-
-@pp.node
 def _apply_slices(
-    da: sc.DataArray | None, slices: Mapping[str, tuple[int, int]]
-) -> sc.DataArray | None:
-    if da is None:
-        return None
+    da: sc.DataArray, slices: Mapping[str, tuple[int, int]]
+) -> sc.DataArray:
     for dim, (start, stop) in slices.items():
         da = da[dim, start] if start == stop else da[dim, start : stop + 1].sum(dim)
     return da
